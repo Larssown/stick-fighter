@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stick Fighter</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; margin: 0 auto; background: #1d1f27; }
+  .ov { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 20px;
+    background: rgba(10,10,15,.88); text-align: center; padding: 16px; }
+  h1 { margin: 0; font-size: 56px; letter-spacing: 4px; font-style: italic; }
+  h2 { margin: 0; }
+  button { font: bold 20px system-ui; padding: 14px 28px; border: 0; border-radius: 10px; background: #ff4d4d; color: #fff; cursor: pointer; }
+  button.blue { background: #4da6ff; }
+  input { font: bold 28px monospace; width: 150px; padding: 10px; text-align: center; text-transform: uppercase; border-radius: 10px; border: 0; letter-spacing: 6px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  .code { font: bold 72px monospace; letter-spacing: 12px; color: #fd3; }
+  .hint { opacity: .7; font-size: 15px; line-height: 1.7; }
+  .err { color: #f77; min-height: 1.2em; }
+  .link { font-size: 14px; opacity: .8; user-select: all; }
+  .rdy { display: flex; gap: 40px; font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+
+<div class="ov" id="ov-menu">
+  <h1>STICK FIGHTER</h1>
+  <button id="btn-create">Skapa match</button>
+  <div class="hint">— eller gå med i en kompis match —</div>
+  <div class="row"><input id="code-in" maxlength="4" placeholder="KOD"><button class="blue" id="btn-join">Gå med</button></div>
+  <div class="err" id="err"></div>
+</div>
+
+<div class="ov" id="ov-wait">
+  <h2>Ge den här koden till din motståndare</h2>
+  <div class="code" id="code-out"></div>
+  <div class="link" id="link-out"></div>
+  <button class="blue" id="btn-copy">Kopiera länk</button>
+  <div class="hint">Väntar på att motståndaren ska ansluta…</div>
+</div>
+
+<div class="ov" id="ov-ready">
+  <h2>Motståndaren är ansluten!</h2>
+  <div class="hint">Gå: <b>A/D</b> eller <b>← →</b> &nbsp;·&nbsp; Hoppa: <b>W</b> eller <b>↑</b> &nbsp;·&nbsp; Blockera: <b>S</b> eller <b>↓</b><br>
+    Slag: <b>F</b> eller <b>K</b> &nbsp;·&nbsp; Spark: <b>G</b> eller <b>L</b></div>
+  <div class="rdy"><span id="rdy1" style="color:#ff4d4d"></span><span id="rdy2" style="color:#4da6ff"></span></div>
+  <div class="hint">Tryck <b>SLAG</b> när du är redo</div>
+</div>
+
+<div class="ov" id="ov-gone">
+  <h2>Anslutningen bröts</h2>
+  <button onclick="location.href = location.pathname">Till menyn</button>
+</div>
+
+<script>
+const W = 960, H = 540, GROUND = 460;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const COLORS = { 1: '#ff4d4d', 2: '#4da6ff' };
+const $ = id => document.getElementById(id);
+
+// ---------- Nätverk ----------
+// Den som skapar matchen (host) kör spelet och skickar läget till gästen varje bildruta.
+// Gästen skickar bara sina knapptryck.
+const PREFIX = 'stickfighter-v1-';
+const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+let role = null, peer = null, conn = null;
+
+function newCode() { return Array.from({ length: 4 }, () => ALPHA[Math.random() * ALPHA.length | 0]).join(''); }
+
+function createMatch() {
+  role = 'host';
+  const code = newCode();
+  peer = new Peer(PREFIX + code);
+  peer.on('open', () => {
+    const link = location.origin + location.pathname + '?join=' + code;
+    $('code-out').textContent = code; $('link-out').textContent = link;
+    $('btn-copy').onclick = () => navigator.clipboard.writeText(link).then(() => $('btn-copy').textContent = 'Kopierad ✓');
+    game.state = 'waiting';
+  });
+  peer.on('connection', c => {
+    if (conn) { c.on('open', () => c.close()); return; }
+    conn = c;
+    c.on('open', () => { game.state = 'ready'; game.ready = { 1: false, 2: false }; });
+    c.on('data', m => {
+      const I = inputs[2];
+      Object.assign(I, m.b); I.pc = m.pc; I.kc = m.kc;
+    });
+    c.on('close', lost);
+  });
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') { peer.destroy(); createMatch(); } // koden upptagen, försök igen
+    else showErr('Fel: ' + e.type);
+  });
+}
+
+function joinMatch(code) {
+  code = code.trim().toUpperCase();
+  if (code.length !== 4) return showErr('Koden är fyra tecken');
+  role = 'guest';
+  $('err').textContent = 'Ansluter…';
+  peer = new Peer();
+  peer.on('open', () => {
+    conn = peer.connect(PREFIX + code, { reliable: true, serialization: 'json' });
+    conn.on('data', applySnapshot);
+    conn.on('close', lost);
+  });
+  peer.on('error', e => {
+    role = null;
+    showErr(e.type === 'peer-unavailable' ? 'Hittar ingen match med koden ' + code : 'Fel: ' + e.type);
+  });
+}
+
+function showErr(t) { $('err').textContent = t; }
+function lost() { if (game.state !== 'menu') game.state = 'gone'; }
+
+$('btn-create').onclick = createMatch;
+$('btn-join').onclick = () => joinMatch($('code-in').value);
+$('code-in').onkeydown = e => { if (e.key === 'Enter') joinMatch($('code-in').value); };
+const joinParam = new URLSearchParams(location.search).get('join');
+if (joinParam) { $('code-in').value = joinParam; joinMatch(joinParam); }
+
+// ---------- Indata ----------
+const mkIn = () => ({ l: 0, r: 0, u: 0, d: 0, pc: 0, kc: 0, usedP: 0, usedK: 0 });
+const inputs = { 1: mkIn(), 2: mkIn() };
+const me = { l: 0, r: 0, u: 0, d: 0, pc: 0, kc: 0 }; // den här datorns tangentbord
+
+const KEYS = {
+  KeyA: 'l', KeyD: 'r', KeyW: 'u', KeyS: 'd', ArrowLeft: 'l', ArrowRight: 'r', ArrowUp: 'u', ArrowDown: 'd',
+  KeyF: 'pc', KeyK: 'pc', KeyJ: 'pc', KeyG: 'kc', KeyL: 'kc',
+};
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = KEYS[e.code]; if (!k) return;
+  e.preventDefault();
+  if (k === 'pc' || k === 'kc') { if (!e.repeat) me[k]++; }
+  else me[k] = 1;
+});
+addEventListener('keyup', e => { const k = KEYS[e.code]; if (k && k.length === 1) me[k] = 0; });
+addEventListener('blur', () => { me.l = me.r = me.u = me.d = 0; });
+
+let lastSent = '';
+function sendInput() {
+  const msg = JSON.stringify({ b: { l: me.l, r: me.r, u: me.u, d: me.d }, pc: me.pc, kc: me.kc });
+  if (msg !== lastSent && conn && conn.open) { conn.send(JSON.parse(msg)); lastSent = msg; }
+}
+
+// ---------- Spelare ----------
+const ATTACKS = {
+  punch: { dur: 16, from: 4, to: 8, range: 72, dmg: 7, push: 4 },
+  kick:  { dur: 26, from: 9, to: 14, range: 98, dmg: 12, push: 7 },
+};
+const mkF = (p, x, facing) => ({ p, x, y: 0, vx: 0, vy: 0, facing, hp: 100, shownHp: 100, st: 'idle', t: 0, hit: false, wins: 0 });
+const fighters = [mkF(1, 250, 1), mkF(2, 710, -1)];
+const sparks = [];
+
+const game = { state: 'menu', t: 0, round: 1, timer: 60, msg: '', ready: { 1: false, 2: false } };
+
+function resetRound() {
+  fighters.forEach((f, i) => Object.assign(f, { x: i ? 710 : 250, y: 0, vx: 0, vy: 0, facing: i ? -1 : 1, hp: 100, shownHp: 100, st: 'idle', t: 0 }));
+  game.timer = 60; game.state = 'intro'; game.t = 0;
+}
+function startMatch() {
+  fighters.forEach(f => f.wins = 0);
+  game.round = 1; resetRound();
+}
+
+function pressed(I) {
+  const p = I.pc > I.usedP || I.kc > I.usedK;
+  I.usedP = I.pc; I.usedK = I.kc;
+  return p;
+}
+
+function updateFighter(f, I, o) {
+  f.t++;
+  const wantP = I.pc > I.usedP, wantK = I.kc > I.usedK;
+  I.usedP = I.pc; I.usedK = I.kc;
+  const onGround = f.y <= 0;
+  const busy = f.st in ATTACKS || f.st === 'hurt' || f.st === 'ko';
+
+  if (!busy && game.state === 'fight') {
+    if (wantP || wantK) {
+      f.st = wantP ? 'punch' : 'kick'; f.t = 0; f.hit = false;
+      if (onGround) f.vx = 0;
+    } else {
+      f.facing = o.x > f.x ? 1 : -1;
+      if (onGround) {
+        if (I.d) { f.st = 'block'; f.vx = 0; }
+        else {
+          f.vx = (I.r - I.l) * 4.5;
+          if (I.u) { f.vy = 14; f.st = 'jump'; }
+          else f.st = f.vx ? 'walk' : 'idle';
+        }
+      } else f.st = 'jump';
+    }
+  } else if (!busy) { f.st = 'idle'; f.vx = 0; }
+
+  // Attack
+  const a = ATTACKS[f.st];
+  if (a) {
+    if (!f.hit && f.t >= a.from && f.t <= a.to) {
+      const dist = (o.x - f.x) * f.facing;
+      if (dist > 0 && dist < a.range && Math.abs(o.y - f.y) < 80 && o.st !== 'ko') {
+        f.hit = true; hitFighter(o, a, f.facing, f);
+      }
+    }
+    if (f.t >= a.dur) { f.st = onGround ? 'idle' : 'jump'; f.t = 0; }
+  }
+  if (f.st === 'hurt' && f.t > 16) { f.st = 'idle'; f.t = 0; }
+  if (f.st === 'hurt' || f.st === 'ko') f.vx *= 0.88;
+
+  // Fysik
+  f.vy -= 0.75; f.y += f.vy;
+  if (f.y <= 0) { f.y = 0; f.vy = 0; if (f.st === 'jump') f.st = 'idle'; }
+  f.x = Math.max(40, Math.min(W - 40, f.x + f.vx));
+}
+
+function hitFighter(o, a, dir, attacker) {
+  const sx = (o.x + attacker.x) / 2 + dir * 20, sy = GROUND - o.y - (a === ATTACKS.kick ? 70 : 110);
+  if (o.st === 'block') {
+    o.hp -= a.dmg * 0.15; o.vx = dir * 3;
+    sparks.push({ x: sx, y: sy, t: 0, c: '#aaa' });
+  } else {
+    o.hp -= a.dmg; o.st = 'hurt'; o.t = 0; o.vx = dir * a.push;
+    sparks.push({ x: sx, y: sy, t: 0, c: '#ffd23f' });
+  }
+  if (o.hp <= 0) { o.hp = 0; o.st = 'ko'; o.t = 0; o.vy = 7; o.vx = dir * 6; endRound(attacker); }
+}
+
+function endRound(winner) {
+  game.state = 'ko'; game.t = 0;
+  if (winner) { winner.wins++; game.msg = winner.wins >= 2 ? `SPELARE ${winner.p} VINNER!` : 'K.O.!'; }
+  else game.msg = 'OAVGJORT';
+}
+
+// Körs bara hos host
+function update() {
+  game.t++;
+  Object.assign(inputs[1], { l: me.l, r: me.r, u: me.u, d: me.d, pc: me.pc, kc: me.kc });
+
+  if (game.state === 'ready') {
+    if (pressed(inputs[1])) game.ready[1] = true;
+    if (pressed(inputs[2])) game.ready[2] = true;
+    if (game.ready[1] && game.ready[2]) startMatch();
+  }
+  if (game.state === 'intro' && game.t > 120) { game.state = 'fight'; game.t = 0; }
+  if (game.state === 'fight' && game.t % 60 === 0 && --game.timer <= 0) {
+    const [a, b] = fighters;
+    endRound(a.hp === b.hp ? null : a.hp > b.hp ? a : b);
+  }
+  if (game.state === 'ko' && game.t > 180) {
+    if (fighters.some(f => f.wins >= 2)) { game.state = 'over'; game.t = 0; }
+    else { game.round++; resetRound(); }
+  }
+  if (game.state === 'over' && game.t > 60) {
+    // Valfritt slag/spark från någon startar ny match
+    if ([pressed(inputs[1]), pressed(inputs[2])].some(Boolean)) { startMatch(); return; }
+  }
+
+  const [a, b] = fighters;
+  updateFighter(a, inputs[1], b);
+  updateFighter(b, inputs[2], a);
+  // Knuffa isär
+  const dx = b.x - a.x;
+  if (Math.abs(dx) < 50 && Math.abs(a.y - b.y) < 90) {
+    const push = (50 - Math.abs(dx)) / 2 * Math.sign(dx || 1);
+    a.x = Math.max(40, a.x - push); b.x = Math.min(W - 40, b.x + push);
+  }
+  sparks.forEach(s => s.t++);
+  while (sparks.length && sparks[0].t > 14) sparks.shift();
+
+  if (conn && conn.open) conn.send({
+    g: { state: game.state, t: game.t, round: game.round, timer: game.timer, msg: game.msg, ready: game.ready },
+    f: fighters.map(({ x, y, facing, hp, st, t, wins }) => ({ x, y, facing, hp, st, t, wins })),
+    s: sparks,
+  });
+}
+
+// Gästen ritar bara upp det senaste läget från host
+function applySnapshot(m) {
+  if (game.state === 'gone') return;
+  Object.assign(game, m.g);
+  m.f.forEach((d, i) => Object.assign(fighters[i], d));
+  sparks.length = 0; sparks.push(...m.s);
+}
+
+// ---------- Rita ----------
+const lerp = (a, b, k) => a + (b - a) * k;
+const lp = (p, q, k) => [lerp(p[0], q[0], k), lerp(p[1], q[1], k)];
+function ext(f, a) {
+  if (f.t < a.from) return f.t / a.from;
+  if (f.t <= a.to) return 1;
+  return Math.max(0, 1 - (f.t - a.to) / (a.dur - a.to));
+}
+
+function pose(f) {
+  // Lokala koordinater: höft i (0,0), y uppåt, framåt = +x
+  let P = {
+    neck: [2, 58], fe: [18, 40], fh: [30, 56], be: [8, 36], bh: [22, 52],
+    fk: [14, -30], ff: [22, -60], bk: [-8, -30], bf: [-20, -60], hip: [0, 0],
+  };
+  const bob = Math.sin(game.t * 0.1) * 2;
+  P.neck[1] += bob; P.fe[1] += bob; P.fh[1] += bob; P.be[1] += bob; P.bh[1] += bob;
+
+  if (f.st === 'walk') {
+    const s = Math.sin(f.t * 0.3) * 14;
+    P.fk = [14 + s * .5, -30]; P.ff = [18 + s, -60]; P.bk = [-8 - s * .5, -30]; P.bf = [-14 - s, -60];
+  } else if (f.st === 'jump') {
+    P.fk = [20, -14]; P.ff = [8, -40]; P.bk = [-2, -20]; P.bf = [-16, -44];
+  } else if (f.st === 'block') {
+    P.fe = [16, 46]; P.fh = [20, 74]; P.be = [12, 44]; P.bh = [16, 70];
+    P.fk = [16, -24]; P.bk = [-10, -24];
+  } else if (f.st === 'punch') {
+    const k = ext(f, ATTACKS.punch);
+    P.fe = lp(P.fe, [36, 58], k); P.fh = lp(P.fh, [70, 60], k); P.neck = lp(P.neck, [10, 56], k);
+  } else if (f.st === 'kick') {
+    const k = ext(f, ATTACKS.kick);
+    P.fk = lp(P.fk, [34, -4], k); P.ff = lp(P.ff, [78, 6], k); P.neck = lp(P.neck, [-14, 54], k);
+    P.bf = lp(P.bf, [-10, -60], k);
+  } else if (f.st === 'hurt' || f.st === 'ko') {
+    P.neck = [-16, 54]; P.fe = [-4, 52]; P.fh = [-20, 66]; P.be = [-14, 48]; P.bh = [-30, 58];
+  }
+  return P;
+}
+
+function drawFighter(f) {
+  const P = pose(f);
+  ctx.save();
+  ctx.translate(f.x, GROUND - f.y);
+  ctx.scale(f.facing, -1);
+  if (f.st === 'ko') ctx.rotate(Math.min(1, f.t / 25) * Math.PI / 2);
+  ctx.translate(0, 60);
+  ctx.strokeStyle = ctx.fillStyle = COLORS[f.p];
+  ctx.lineWidth = 7; ctx.lineCap = ctx.lineJoin = 'round';
+  if (f.st === 'hurt' && f.t % 4 < 2) ctx.strokeStyle = ctx.fillStyle = '#fff';
+  const line = (...pts) => { ctx.beginPath(); ctx.moveTo(...pts[0]); pts.slice(1).forEach(p => ctx.lineTo(...p)); ctx.stroke(); };
+  line(P.hip, P.bk, P.bf);
+  line(P.neck, P.be, P.bh);
+  line(P.hip, P.neck);
+  line(P.hip, P.fk, P.ff);
+  line(P.neck, P.fe, P.fh);
+  ctx.beginPath(); ctx.arc(P.neck[0] + 2, P.neck[1] + 18, 14, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  // Bakgrund
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#2b1d3a'); g.addColorStop(1, '#e0704a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1a1a22'; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = '#2a2a35'; for (let x = 0; x < W; x += 80) ctx.fillRect(x, GROUND, 40, 4);
+
+  // Skuggor + gubbar
+  for (const f of fighters) {
+    f.shownHp += (f.hp - f.shownHp) * 0.08;
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.beginPath(); ctx.ellipse(f.x, GROUND + 4, 30 - f.y / 10, 6, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  fighters.forEach(drawFighter);
+
+  for (const s of sparks) {
+    ctx.strokeStyle = s.c; ctx.lineWidth = 4;
+    for (let i = 0; i < 8; i++) {
+      const ang = i * Math.PI / 4, r1 = 6 + s.t * 2, r2 = r1 + 12;
+      ctx.beginPath();
+      ctx.moveTo(s.x + Math.cos(ang) * r1, s.y + Math.sin(ang) * r1);
+      ctx.lineTo(s.x + Math.cos(ang) * r2, s.y + Math.sin(ang) * r2);
+      ctx.stroke();
+    }
+  }
+
+  // HUD
+  const myP = role === 'guest' ? 2 : 1;
+  fighters.forEach((f, i) => {
+    const w = 380, x = i ? W - 40 - w : 40, y = 30;
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 3, y - 3, w + 6, 30);
+    ctx.fillStyle = '#c33'; ctx.fillRect(i ? x + w - w * f.shownHp / 100 : x, y, w * f.shownHp / 100, 24);
+    ctx.fillStyle = '#fd3'; ctx.fillRect(i ? x + w - w * f.hp / 100 : x, y, w * f.hp / 100, 24);
+    ctx.fillStyle = COLORS[f.p]; ctx.font = 'bold 18px system-ui'; ctx.textAlign = i ? 'right' : 'left';
+    ctx.fillText(f.p === myP ? 'DU' : 'MOTSTÅNDARE', i ? x + w : x, y + 48);
+    for (let n = 0; n < 2; n++) {
+      ctx.fillStyle = n < f.wins ? '#fd3' : '#444';
+      ctx.beginPath(); ctx.arc(i ? x + w - 150 - n * 22 : x + 150 + n * 22, y + 42, 7, 0, Math.PI * 2); ctx.fill();
+    }
+  });
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 34px system-ui';
+  ctx.fillText(game.timer, W / 2, 56);
+
+  const big = (txt, sub) => {
+    ctx.font = 'italic bold 80px system-ui'; ctx.lineWidth = 8; ctx.strokeStyle = '#000';
+    ctx.strokeText(txt, W / 2, H / 2 - 20); ctx.fillStyle = '#fff'; ctx.fillText(txt, W / 2, H / 2 - 20);
+    if (sub) { ctx.font = 'bold 22px system-ui'; ctx.fillText(sub, W / 2, H / 2 + 30); }
+  };
+  if (game.state === 'intro') big(game.t < 70 ? `ROND ${game.round}` : 'FIGHT!');
+  if (game.state === 'ko') big(game.msg);
+  if (game.state === 'over') big(game.msg, game.t > 60 ? 'Slå eller sparka för ny match' : '');
+}
+
+function updateOverlays() {
+  const show = { menu: 'ov-menu', waiting: 'ov-wait', ready: 'ov-ready', gone: 'ov-gone' }[game.state];
+  for (const el of document.querySelectorAll('.ov')) el.style.display = el.id === show ? 'flex' : 'none';
+  if (game.state === 'ready') {
+    $('rdy1').textContent = 'Röd: ' + (game.ready[1] ? 'REDO ✓' : 'väntar…');
+    $('rdy2').textContent = 'Blå: ' + (game.ready[2] ? 'REDO ✓' : 'väntar…');
+  }
+}
+
+// ---------- Loop (fast 60 Hz) ----------
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  cv.style.marginTop = (innerHeight - H * s) / 2 + 'px';
+}
+addEventListener('resize', fit); fit();
+let acc = 0, prev = performance.now();
+function loop(now) {
+  acc += Math.min(100, now - prev); prev = now;
+  while (acc >= 1000 / 60) {
+    if (role === 'host') update(); else if (role === 'guest') sendInput();
+    acc -= 1000 / 60;
+  }
+  draw();
+  updateOverlays();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
